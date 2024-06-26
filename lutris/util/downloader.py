@@ -9,6 +9,10 @@ from lutris import __version__
 from lutris.util import jobs
 from lutris.util.log import logger
 
+from urllib3.util import Retry
+from requests import Session, RequestException
+from requests.adapters import HTTPAdapter
+
 # `time.time` can skip ahead or even go backwards if the current
 # system time is changed between invocations. Use `time.monotonic`
 # so we won't have screenshots making fun of us for showing negative
@@ -126,16 +130,35 @@ class Downloader:
 
     def async_download(self):
         try:
-            headers = requests.utils.default_headers()
-            headers["User-Agent"] = "Lutris/%s" % __version__
-            if self.referer:
-                headers["Referer"] = self.referer
-            response = requests.get(self.url, headers=headers, stream=True, timeout=30, cookies=self.cookies)
-            if response.status_code != 200:
-                logger.info("%s returned a %s error", self.url, response.status_code)
-            response.raise_for_status()
+            retries = Retry(connect=10, read=0, redirect=10, status=10, other=0, backoff_factor=1, status_forcelist=[ 502, 503, 504 ])
+            self.do_async_download(retries)
+            self.on_download_completed()
+        except Exception as ex:
+            logger.exception("Download failed: %s", ex)
+            self.on_download_failed(ex)
+
+    def do_async_download(self, retries, range=None):
+        session = Session()
+        session.mount('https://', HTTPAdapter(max_retries=retries))
+        headers = requests.utils.default_headers()
+        headers["User-Agent"] = "Lutris/%s" % __version__
+        if self.referer:
+            headers["Referer"] = self.referer
+        if range:
+            headers["Range"] = range
+        response = session.get(self.url, headers=headers, stream=True, timeout=30, cookies=self.cookies)
+        if response.status_code == 206:
+            logger.info("Resuming download")
+        elif response.status_code == 200:
             self.full_size = int(response.headers.get("Content-Length", "").strip() or 0)
-            self.progress_event.set()
+            self.downloaded_size = 0
+            if self.file_pointer:
+                self.file_pointer.seek(0)
+        else:
+            logger.info("%s returned a %s error", self.url, response.status_code)
+        response.raise_for_status()
+        self.progress_event.set()
+        try:
             for chunk in response.iter_content(chunk_size=8192):
                 if not self.file_pointer:
                     break
@@ -143,10 +166,14 @@ class Downloader:
                     self.downloaded_size += len(chunk)
                     self.file_pointer.write(chunk)
                 self.progress_event.set()
-            self.on_download_completed()
-        except Exception as ex:
-            logger.exception("Download failed: %s", ex)
-            self.on_download_failed(ex)
+        except RequestException as ex:
+            retries = retries.increment(method="GET", url=self.url)
+            if retries.is_exhausted():
+                raise ex
+            else:
+                logger.info("Download interrupted. Retrying")
+                range = "bytes=%d-%d" % (self.downloaded_size, self.full_size)
+                self.do_async_download(retries, range)
 
     def on_download_failed(self, error: Exception):
         # Cancelling closes the file, which can result in an
